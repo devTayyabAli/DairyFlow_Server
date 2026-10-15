@@ -1,5 +1,14 @@
+import dns from 'node:dns';
 import { Collection, Db, MongoClient, ObjectId } from 'mongodb';
 import { config } from './config.js';
+
+if (config.MONGODB_URI.startsWith('mongodb+srv://')) {
+  try {
+    dns.setServers(['8.8.8.8', '1.1.1.1']);
+  } catch {
+    // Ignore if not permitted in environment
+  }
+}
 
 export interface FarmDocument {
   _id?: ObjectId;
