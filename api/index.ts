@@ -23,10 +23,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   // Strip /api prefix if rewritten by Vercel so Fastify routes match cleanly
   if (req.url) {
-    if (req.url === '/api') {
+    if (req.url === '/api' || req.url === '/api/') {
       req.url = '/';
     } else if (req.url.startsWith('/api/')) {
-      req.url = req.url.replace(/^\/api/, '');
+      req.url = req.url.replace(/^\/api/, '') || '/';
     }
   }
 
