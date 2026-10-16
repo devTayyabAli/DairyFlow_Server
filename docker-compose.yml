@@ -1,3 +1,8 @@
+# Usage
+#   Database only (develop the API on the host with `npm run dev`):
+#       docker compose up -d mongodb
+#   Database + API container (needs a filled-in .env, see .env.example):
+#       docker compose up -d --build
 services:
   mongodb:
     image: mongo:7.0
@@ -9,6 +14,29 @@ services:
       MONGO_INITDB_DATABASE: dairyflow
     volumes:
       - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  api:
+    build: .
+    container_name: dairyflow-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      # Inside the compose network MongoDB is reachable as "mongodb", whatever .env says.
+      MONGODB_URI: mongodb://mongodb:27017
+    ports:
+      - "${PORT:-3000}:3000"
+    depends_on:
+      mongodb:
+        condition: service_healthy
 
 volumes:
   mongo_data:

@@ -8,8 +8,8 @@ const pushBodySchema = z.object({
 });
 
 const pullQuerySchema = z.object({
-  since: z.coerce.number().min(0).default(0),
-  limit: z.coerce.number().min(1).max(500).default(500),
+  since: z.coerce.number().int('since must be an integer').min(0, 'since must be >= 0').default(0),
+  limit: z.coerce.number().int('limit must be an integer').min(1, 'limit must be >= 1').max(500, 'limit must be <= 500').default(500),
 });
 
 export const syncRoutes: FastifyPluginAsync = async (fastify) => {
@@ -17,6 +17,8 @@ export const syncRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.post(
     '/sync/push',
     {
+      // Larger than the global 1 MB limit: 500 changes with long notes.
+      bodyLimit: 2 * 1024 * 1024,
       onRequest: [fastify.authenticate],
     },
     async (request, reply) => {

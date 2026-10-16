@@ -8,11 +8,11 @@ export const MAX_VERIFY_ATTEMPTS = 5;
 export const RESEND_COOLDOWN_SECONDS = 60;
 export const MAX_SENDS_PER_HOUR = 5;
 
-const PURPOSE = 'register';
+export type OtpPurpose = 'register' | 'reset';
 
-function hashCode(email: string, code: string): string {
+function hashCode(purpose: OtpPurpose, email: string, code: string): string {
   // Keyed hash so a leaked otps collection cannot be brute-forced offline without the secret.
-  return createHmac('sha256', config.JWT_SECRET).update(`${PURPOSE}:${email}:${code}`).digest('hex');
+  return createHmac('sha256', config.JWT_SECRET).update(`${purpose}:${email}:${code}`).digest('hex');
 }
 
 function generateCode(): string {
@@ -26,7 +26,13 @@ export type IssueResult =
   | { ok: false; reason: 'SEND_FAILED' };
 
 /** Creates (or replaces) the pending OTP for an email and sends it. Enforces resend limits. */
-export async function issueOtp(email: string): Promise<IssueResult> {
+export async function issueOtp(
+  email: string,
+  purpose: OtpPurpose = 'register',
+  opts: { deliver?: boolean } = {}
+): Promise<IssueResult> {
+  const PURPOSE = purpose;
+  const deliver = opts.deliver !== false;
   const col = getOtpsCollection();
   const now = new Date();
   const existing = await col.findOne({ email, purpose: PURPOSE });
@@ -62,7 +68,7 @@ export async function issueOtp(email: string): Promise<IssueResult> {
     { email, purpose: PURPOSE },
     {
       $set: {
-        codeHash: hashCode(email, code),
+        codeHash: hashCode(PURPOSE, email, code),
         expiresAt: new Date(now.getTime() + ttlMs),
         attempts: 0,
         lastSentAt: now,
@@ -76,7 +82,9 @@ export async function issueOtp(email: string): Promise<IssueResult> {
   );
 
   try {
-    await getMailer().sendOtp(email, code, config.OTP_TTL_MINUTES);
+    // deliver=false stores a decoy code that is never emailed (used so that password-reset
+    // requests for unknown emails are indistinguishable from real ones).
+    if (deliver) await getMailer().sendOtp(email, code, config.OTP_TTL_MINUTES, PURPOSE);
   } catch (err) {
     console.error('Failed to send OTP email:', err instanceof Error ? err.message : err);
     return { ok: false, reason: 'SEND_FAILED' };
@@ -93,7 +101,12 @@ export type VerifyResult =
   | { ok: false; reason: 'NOT_FOUND' };
 
 /** Checks a submitted code. Single use: a correct code is consumed. Wrong codes are counted. */
-export async function verifyOtp(email: string, code: string): Promise<VerifyResult> {
+export async function verifyOtp(
+  email: string,
+  code: string,
+  purpose: OtpPurpose = 'register'
+): Promise<VerifyResult> {
+  const PURPOSE = purpose;
   const col = getOtpsCollection();
   const doc = await col.findOne({ email, purpose: PURPOSE });
   if (!doc) return { ok: false, reason: 'NOT_FOUND' };
@@ -102,7 +115,7 @@ export async function verifyOtp(email: string, code: string): Promise<VerifyResu
   if (doc.attempts >= MAX_VERIFY_ATTEMPTS) return { ok: false, reason: 'LOCKED' };
 
   const expected = Buffer.from(doc.codeHash, 'hex');
-  const given = Buffer.from(hashCode(email, code), 'hex');
+  const given = Buffer.from(hashCode(PURPOSE, email, code), 'hex');
   const match = expected.length === given.length && timingSafeEqual(expected, given);
 
   if (!match) {

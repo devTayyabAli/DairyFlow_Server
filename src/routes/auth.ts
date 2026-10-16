@@ -1,7 +1,9 @@
 import bcrypt from 'bcryptjs';
 import { FastifyInstance, FastifyPluginAsync, FastifyReply } from 'fastify';
+import { ObjectId } from 'mongodb';
 import { z } from 'zod';
 import { FarmDocument, getFarmsCollection } from '../db.js';
+import { checkLoginThrottle, clearLoginFailures, recordLoginFailure } from '../loginThrottle.js';
 import { IssueResult, issueOtp, OTP_LENGTH, verifyOtp } from '../otp.js';
 
 const emailSchema = z
@@ -31,6 +33,21 @@ const verifySchema = z.object({
 });
 
 const resendSchema = z.object({ email: emailSchema });
+
+const newPasswordSchema = z.string().min(8, 'Password must be at least 8 characters').max(128);
+
+const forgotSchema = z.object({ email: emailSchema });
+
+const resetSchema = z.object({
+  email: emailSchema,
+  otp: verifySchema.shape.otp,
+  newPassword: newPasswordSchema,
+});
+
+const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1, 'Current password is required'),
+  newPassword: newPasswordSchema,
+});
 
 // Compared against when the email is unknown, so response time does not reveal which emails exist.
 const DUMMY_HASH = bcrypt.hashSync('dairyflow-timing-equaliser', 10);
@@ -73,8 +90,41 @@ function otpIssueFailure(reply: FastifyReply, result: Exclude<IssueResult, { ok:
     .send({ error: { code, message, retryAfterSeconds: result.retryAfterSeconds } });
 }
 
-function signToken(fastify: FastifyInstance, farmId: string): string {
-  return fastify.jwt.sign({ farmId });
+function signToken(fastify: FastifyInstance, farmId: string, passwordChangedAt?: Date): string {
+  return fastify.issueToken(farmId, passwordChangedAt);
+}
+
+function throttled(reply: FastifyReply, retryAfterSeconds: number) {
+  return reply
+    .status(429)
+    .header('Retry-After', String(retryAfterSeconds))
+    .send({
+      error: {
+        code: 'LOGIN_THROTTLED',
+        message: 'Too many failed sign-in attempts. Please try again later.',
+        retryAfterSeconds,
+      },
+    });
+}
+
+/** Shared by verify-otp and reset-password so both answer failures identically. */
+function otpFailure(reply: FastifyReply, result: Exclude<Awaited<ReturnType<typeof verifyOtp>>, { ok: true }>) {
+  if (result.reason === 'LOCKED') {
+    return reply.status(429).send({
+      error: {
+        code: 'OTP_LOCKED',
+        message: 'Too many wrong codes. Request a new code to continue.',
+      },
+    });
+  }
+  if (result.reason === 'EXPIRED' || result.reason === 'NOT_FOUND') {
+    return reply.status(400).send({
+      error: { code: 'OTP_EXPIRED', message: 'This code has expired. Request a new one.' },
+    });
+  }
+  return reply.status(400).send({
+    error: { code: 'OTP_INVALID', message: 'Incorrect code', attemptsLeft: result.attemptsLeft },
+  });
 }
 
 export const authRoutes: FastifyPluginAsync = async (fastify) => {
@@ -169,28 +219,7 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
       }
 
       const result = await verifyOtp(email, otp);
-      if (!result.ok) {
-        if (result.reason === 'LOCKED') {
-          return reply.status(429).send({
-            error: {
-              code: 'OTP_LOCKED',
-              message: 'Too many wrong codes. Request a new code to continue.',
-            },
-          });
-        }
-        if (result.reason === 'EXPIRED' || result.reason === 'NOT_FOUND') {
-          return reply.status(400).send({
-            error: { code: 'OTP_EXPIRED', message: 'This code has expired. Request a new one.' },
-          });
-        }
-        return reply.status(400).send({
-          error: {
-            code: 'OTP_INVALID',
-            message: 'Incorrect code',
-            attemptsLeft: result.attemptsLeft,
-          },
-        });
-      }
+      if (!result.ok) return otpFailure(reply, result);
 
       const now = new Date();
       await farms.updateOne({ _id: farm._id }, { $set: { emailVerified: true, updatedAt: now } });
@@ -239,10 +268,14 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
       }
 
       const { email, password } = parsed.data;
+      const gate = await checkLoginThrottle(email);
+      if (gate.blocked) return throttled(reply, gate.retryAfterSeconds);
+
       const farm = await getFarmsCollection().findOne({ email });
 
       const passwordOk = await bcrypt.compare(password, farm?.passwordHash ?? DUMMY_HASH);
       if (!farm || !passwordOk) {
+        await recordLoginFailure(email);
         return reply.status(401).send({
           error: { code: 'INVALID_CREDENTIALS', message: 'Invalid email or password' },
         });
@@ -258,10 +291,121 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
         });
       }
 
+      await clearLoginFailures(email);
       return reply.status(200).send({
         token: signToken(fastify, farm._id!.toString()),
         farm: farmPayload({ ...farm, _id: farm._id! }),
       });
+    }
+  );
+
+  // Always 202 with the same body: never reveals whether the email has an account. A code is
+  // only emailed for a verified account; for anything else a decoy (never delivered) code is
+  // stored so every later response (wrong code, attempts left, lock, cooldown) looks identical.
+  fastify.post(
+    '/auth/forgot-password',
+    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const parsed = forgotSchema.safeParse(request.body);
+      if (!parsed.success) return validationError(reply, parsed.error.issues);
+
+      const { email } = parsed.data;
+      const farm = await getFarmsCollection().findOne({ email }, { projection: { emailVerified: 1 } });
+      const real = !!farm && farm.emailVerified !== false;
+      const issued = await issueOtp(email, 'reset', { deliver: real });
+      if (!issued.ok) {
+        // Cooldown / hourly limit / send failure are swallowed on purpose (they would reveal
+        // the account exists). They are still enforced: no new code is sent.
+        request.log.warn({ reason: issued.reason }, 'forgot-password: code not issued');
+      }
+      return reply.status(202).send({ status: 'OTP_SENT', email });
+    }
+  );
+
+  fastify.post(
+    '/auth/reset-password',
+    { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const parsed = resetSchema.safeParse(request.body);
+      if (!parsed.success) return validationError(reply, parsed.error.issues);
+
+      const { email, otp, newPassword } = parsed.data;
+      const result = await verifyOtp(email, otp, 'reset');
+      if (!result.ok) return otpFailure(reply, result);
+
+      const farms = getFarmsCollection();
+      const farm = await farms.findOne({ email });
+      if (!farm || farm.emailVerified === false) {
+        // Only reachable with a decoy code, which nobody can know.
+        return reply.status(400).send({
+          error: { code: 'OTP_INVALID', message: 'Invalid or expired code' },
+        });
+      }
+
+      const passwordChangedAt = new Date();
+      const passwordHash = await bcrypt.hash(newPassword, 10);
+      await farms.updateOne(
+        { _id: farm._id },
+        { $set: { passwordHash, passwordChangedAt, updatedAt: passwordChangedAt } }
+      );
+      await clearLoginFailures(email);
+
+      return reply.status(200).send({
+        token: signToken(fastify, farm._id!.toString(), passwordChangedAt),
+        farm: farmPayload({ ...farm, _id: farm._id! }),
+      });
+    }
+  );
+
+  fastify.post(
+    '/auth/change-password',
+    {
+      onRequest: [fastify.authenticate],
+      config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+    },
+    async (request, reply) => {
+      const parsed = changePasswordSchema.safeParse(request.body);
+      if (!parsed.success) return validationError(reply, parsed.error.issues);
+      const { currentPassword, newPassword } = parsed.data;
+
+      const farms = getFarmsCollection();
+      const farm = await farms.findOne({ _id: new ObjectId(request.farmId) });
+      if (!farm) {
+        return reply.status(401).send({
+          error: { code: 'UNAUTHORIZED', message: 'Invalid authorization token' },
+        });
+      }
+
+      // A stolen token must not allow guessing the current password: share the login throttle.
+      if (farm.email) {
+        const gate = await checkLoginThrottle(farm.email);
+        if (gate.blocked) return throttled(reply, gate.retryAfterSeconds);
+      }
+
+      if (!(await bcrypt.compare(currentPassword, farm.passwordHash))) {
+        if (farm.email) await recordLoginFailure(farm.email);
+        return reply.status(401).send({
+          error: { code: 'INVALID_CREDENTIALS', message: 'Current password is incorrect' },
+        });
+      }
+      if (newPassword === currentPassword) {
+        return reply.status(400).send({
+          error: {
+            code: 'PASSWORD_UNCHANGED',
+            message: 'New password must be different from the current password',
+          },
+        });
+      }
+
+      const passwordChangedAt = new Date();
+      const passwordHash = await bcrypt.hash(newPassword, 10);
+      await farms.updateOne(
+        { _id: farm._id },
+        { $set: { passwordHash, passwordChangedAt, updatedAt: passwordChangedAt } }
+      );
+      if (farm.email) await clearLoginFailures(farm.email);
+
+      return reply.status(200).send({ token: signToken(fastify, farm._id!.toString(), passwordChangedAt) });
     }
   );
 };

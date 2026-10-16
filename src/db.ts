@@ -21,6 +21,8 @@ export interface FarmDocument {
   phone?: string;
   passwordHash: string;
   defaultMilkRate?: number;
+  /** Set on password reset/change; JWTs issued before it are rejected (see plugins/auth.ts). */
+  passwordChangedAt?: Date;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -54,7 +56,24 @@ export interface RecordDocument {
 
 export interface CounterDocument {
   _id: string; // farmId
+  /** Highest sequence number ALLOCATED to a push. */
   seq: number;
+  /**
+   * Commit watermark: every seq <= committed is fully written. Pull never reads past it, so a
+   * pull cannot skip a row whose push has allocated a seq but not finished writing.
+   * Absent on documents created before the watermark existed (treated as equal to seq).
+   */
+  committed?: number;
+  /** Per-farm push lease (pushes for one farm are serialised). */
+  lockId?: string | null;
+  lockUntil?: Date | null;
+}
+
+export interface LoginAttemptDocument {
+  _id: string; // lower-cased email
+  failures: number;
+  windowStartedAt: Date;
+  purgeAt: Date;
 }
 
 let client: MongoClient | null = null;
@@ -62,7 +81,12 @@ let db: Db | null = null;
 
 export async function connectToDb(uri = config.MONGODB_URI, dbName = config.MONGODB_DB): Promise<Db> {
   if (!client) {
-    client = new MongoClient(uri);
+    client = new MongoClient(uri, {
+      maxPoolSize: config.MONGODB_MAX_POOL_SIZE,
+      serverSelectionTimeoutMS: config.MONGODB_SERVER_SELECTION_TIMEOUT_MS,
+      connectTimeoutMS: 10_000,
+      socketTimeoutMS: 45_000,
+    });
     await client.connect();
     db = client.db(dbName);
     await ensureIndexes();
@@ -93,6 +117,10 @@ export function getOtpsCollection(): Collection<OtpDocument> {
   return getDb().collection<OtpDocument>('otps');
 }
 
+export function getLoginAttemptsCollection(): Collection<LoginAttemptDocument> {
+  return getDb().collection<LoginAttemptDocument>('login_attempts');
+}
+
 export function getRecordsCollection(): Collection<RecordDocument> {
   return getDb().collection<RecordDocument>('records');
 }
@@ -118,6 +146,8 @@ export async function ensureIndexes(): Promise<void> {
   const otps = getOtpsCollection();
   await otps.createIndex({ email: 1, purpose: 1 }, { unique: true });
   await otps.createIndex({ purgeAt: 1 }, { expireAfterSeconds: 0 });
+
+  await getLoginAttemptsCollection().createIndex({ purgeAt: 1 }, { expireAfterSeconds: 0 });
 
   const records = getRecordsCollection();
   await records.createIndex({ farmId: 1, table: 1, uuid: 1 }, { unique: true });
