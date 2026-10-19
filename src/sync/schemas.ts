@@ -91,7 +91,16 @@ export const livestockActivitySchema = z.object({
   created_at: z.string(),
 });
 
-export const ALLOWED_SYNC_SETTINGS = ['farm_name', 'admin_name', 'admin_phone', 'default_milk_rate'] as const;
+// Keep in sync with SYNCED_SETTING_KEYS in mobile/src/db/database.ts.
+export const ALLOWED_SYNC_SETTINGS = [
+  'farm_name',
+  'admin_name',
+  'admin_phone',
+  'default_milk_rate',
+  'fat_pricing_enabled',
+  'fat_pricing_reference_fat',
+  'fat_pricing_slope',
+] as const;
 
 export const settingsSchema = z.object({
   value: z.string(),
