@@ -48,17 +48,19 @@ export const farmRoutes: FastifyPluginAsync = async (fastify) => {
         email: farm.email,
         phone: farm.phone,
         defaultMilkRate: farm.defaultMilkRate ?? 220,
+        businessType: farm.businessType ?? 'farm',
+        role: request.role ?? 'owner',
         createdAt: farm.createdAt.toISOString(),
         updatedAt: farm.updatedAt.toISOString(),
       });
     }
   );
 
-  // Update farm profile
+  // Update farm/business profile (restricted to Owner & Manager per PRD permission matrix)
   fastify.patch(
     '/farm',
     {
-      onRequest: [fastify.authenticate],
+      onRequest: [fastify.authenticate, fastify.authorize(['owner', 'manager'])],
     },
     async (request, reply) => {
       const parseResult = updateFarmSchema.safeParse(request.body);

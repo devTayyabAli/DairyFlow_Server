@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { getCountersCollection, getRecordsCollection, RecordDocument } from '../db.js';
+import { bandsConflict, decideMilkUpsert, FatBandRecord } from './pricing.js';
 import {
   ALLOWED_SYNC_SETTINGS,
   Change,
@@ -96,7 +97,24 @@ async function releaseFarmLock(farmId: string, lockId: string, committed?: numbe
   await getCountersCollection().updateOne({ _id: farmId, lockId }, { $set: set });
 }
 
-export async function applyPush(farmId: string, changes: Change[]): Promise<PushResult> {
+export interface PushActor {
+  userId: string;
+  role: string;
+}
+
+function toBand(data: Record<string, unknown>, uuid: string): FatBandRecord {
+  return {
+    uuid,
+    min_fat: Number(data.min_fat),
+    max_fat: Number(data.max_fat),
+    rate_per_liter: Number(data.rate_per_liter),
+    effective_from: String(data.effective_from),
+    effective_to: typeof data.effective_to === 'string' ? data.effective_to : null,
+    active: Number(data.active ?? 1),
+  };
+}
+
+export async function applyPush(farmId: string, changes: Change[], actor?: PushActor): Promise<PushResult> {
   const rejected: Array<{ uuid: string; table: string; reason: string }> = [];
   const validChanges: Array<{
     change: Change;
@@ -152,6 +170,14 @@ export async function applyPush(farmId: string, changes: Change[]): Promise<Push
         validatedData: parsed.data as Record<string, unknown>,
       });
     } else if (change.op === 'delete') {
+      if (change.table === 'ledger_entries') {
+        rejected.push({
+          uuid: change.uuid,
+          table: change.table,
+          reason: 'Ledger entries are immutable and cannot be deleted. Create a compensating adjustment entry instead.',
+        });
+        continue;
+      }
       validChanges.push({
         change,
         validatedData: undefined,
@@ -221,6 +247,102 @@ export async function applyPush(farmId: string, changes: Change[]): Promise<Push
       changesToApply.push(vc);
     }
 
+    // Fat bands and milk are checked under the farm lock so two overlapping
+    // rates or two collections for the same shift cannot both land.
+    // Conflict policy: last client timestamp wins for ordinary edits. A change
+    // the server refuses is returned in `rejected` and is not applied. Ledger
+    // rows and milk rows are not deleted. A milk row keeps its saved rate when
+    // the fat percentage is unchanged.
+    const bandDocs = await recordsCol.find({ farmId, table: 'fat_rate_bands', deleted: false }).toArray();
+    let bands = bandDocs.map((doc) => toBand(doc.data ?? {}, doc.uuid));
+    const milkDocs = await recordsCol
+      .find({ farmId, table: 'milk_collections', deleted: false })
+      .toArray();
+    const takenShifts = new Set<string>();
+    for (const doc of milkDocs) {
+      const data = doc.data ?? {};
+      takenShifts.add(`${data.supplier_uuid}|${data.date}|${data.shift}`);
+    }
+    const assignedSuppliers = new Set<string>();
+    if (actor?.role === 'collector') {
+      const assignmentDocs = await recordsCol
+        .find({
+          farmId,
+          table: 'collector_assignments',
+          deleted: false,
+          'data.collector_user_id': actor.userId,
+          'data.active': 1,
+        })
+        .toArray();
+      for (const doc of assignmentDocs) {
+        const supplierUuid = doc.data?.supplier_uuid;
+        if (typeof supplierUuid === 'string') assignedSuppliers.add(supplierUuid);
+      }
+    }
+
+    const screened: typeof changesToApply = [];
+    for (const vc of changesToApply) {
+      if (vc.change.table === 'milk_collections' && vc.change.op === 'delete') {
+        rejected.push({
+          uuid: vc.change.uuid,
+          table: vc.change.table,
+          reason: 'Milk collections are not deleted. Correct the entry instead.',
+        });
+        continue;
+      }
+      if (vc.change.table === 'fat_rate_bands' && vc.change.op === 'delete') {
+        rejected.push({
+          uuid: vc.change.uuid,
+          table: vc.change.table,
+          reason: 'Deactivate a fat-rate band instead of deleting it.',
+        });
+        continue;
+      }
+      if (vc.change.table === 'fat_rate_bands' && vc.change.op === 'upsert' && vc.validatedData) {
+        const candidate = toBand(vc.validatedData, vc.change.uuid);
+        if (bandsConflict(candidate, bands)) {
+          rejected.push({
+            uuid: vc.change.uuid,
+            table: vc.change.table,
+            reason: 'This fat range overlaps another active band on the same dates.',
+          });
+          continue;
+        }
+        bands = bands.filter((band) => band.uuid !== candidate.uuid).concat(candidate);
+        screened.push(vc);
+        continue;
+      }
+      if (vc.change.table === 'milk_collections' && vc.change.op === 'upsert' && vc.validatedData) {
+        const data = vc.validatedData;
+        const key = `${data.supplier_uuid}|${data.date}|${data.shift}`;
+        const existingDoc = existingMap.get(`milk_collections:${vc.change.uuid}`);
+        const existing = existingDoc && !existingDoc.deleted ? (existingDoc.data ?? null) : null;
+        const previousKey = existing
+          ? `${existing.supplier_uuid}|${existing.date}|${existing.shift}`
+          : '';
+        if (previousKey) takenShifts.delete(previousKey);
+        const decision = decideMilkUpsert({
+          data,
+          existing,
+          bands,
+          shiftTaken: takenShifts.has(key),
+          assigned: actor?.role !== 'collector' || assignedSuppliers.has(String(data.supplier_uuid)),
+        });
+        if (!decision.ok) {
+          if (previousKey) takenShifts.add(previousKey);
+          rejected.push({ uuid: vc.change.uuid, table: vc.change.table, reason: decision.reason });
+          continue;
+        }
+        vc.validatedData = decision.data;
+        takenShifts.add(key);
+        screened.push(vc);
+        continue;
+      }
+      screened.push(vc);
+    }
+    changesToApply.length = 0;
+    changesToApply.push(...screened);
+
     appliedCount = changesToApply.length + ignoredCount;
 
     // 3. Allocate a contiguous seq range, write it, then advance the commit watermark.
@@ -277,10 +399,53 @@ export async function applyPush(farmId: string, changes: Change[]): Promise<Push
   };
 }
 
+export interface PullViewer {
+  userId: string;
+  role: string;
+}
+
+export interface VisibilityScope {
+  farmerSupplierUuids: Set<string>;
+  collectorSupplierUuids: Set<string>;
+}
+
+/** Owner sees the whole business. A dodhi sees assigned dairies, the fat table, and his own collections. A dairy sees its own milk, bills, and payments. */
+export function recordVisibleTo(
+  doc: { table: string; uuid: string; data?: Record<string, unknown> },
+  viewer: PullViewer,
+  scope: VisibilityScope
+): boolean {
+  if (viewer.role === 'collector') {
+    if (doc.table === 'fat_rate_bands') return true;
+    if (doc.table === 'collector_assignments') return doc.data?.collector_user_id === viewer.userId;
+    if (doc.table === 'suppliers') return scope.collectorSupplierUuids.has(doc.uuid);
+    if (doc.table === 'milk_collections') return doc.data?.collector_id === viewer.userId;
+    return false;
+  }
+  if (viewer.role === 'farmer') {
+    if (doc.table === 'suppliers') return doc.data?.linked_farm_id === viewer.userId;
+    if (doc.table === 'milk_collections') {
+      const supplierUuid = doc.data?.supplier_uuid;
+      return typeof supplierUuid === 'string' && scope.farmerSupplierUuids.has(supplierUuid);
+    }
+    if (doc.table === 'ledger_entries') {
+      const accountUuid = doc.data?.account_uuid;
+      return doc.data?.account_type === 'supplier' && typeof accountUuid === 'string' && scope.farmerSupplierUuids.has(accountUuid);
+    }
+    if (doc.table === 'settlements') {
+      const targetUuid = doc.data?.target_uuid;
+      return doc.data?.target_type === 'supplier' && typeof targetUuid === 'string' && scope.farmerSupplierUuids.has(targetUuid);
+    }
+    return false;
+  }
+  return true;
+}
+
 export async function pullChanges(
   farmId: string,
   since: number = 0,
-  limit: number = 500
+  limit: number = 500,
+  viewer?: PullViewer
 ): Promise<PullResult> {
   const safeLimit = Math.min(Math.max(1, limit), 500);
   const recordsCol = getRecordsCollection();
@@ -302,7 +467,42 @@ export async function pullChanges(
   const hasMore = docs.length > safeLimit;
   const selectedDocs = hasMore ? docs.slice(0, safeLimit) : docs;
 
-  const changes: ServerChange[] = selectedDocs.map((doc) => ({
+  let farmerSupplierUuids = new Set<string>();
+  if (viewer?.role === 'farmer') {
+    const supplierRows = await recordsCol
+      .find(
+        { farmId, table: 'suppliers', deleted: false, 'data.linked_farm_id': viewer.userId },
+        { projection: { uuid: 1 } }
+      )
+      .toArray();
+    farmerSupplierUuids = new Set(supplierRows.map((row) => row.uuid));
+  }
+
+  let collectorSupplierUuids = new Set<string>();
+  if (viewer?.role === 'collector') {
+    const assignmentRows = await recordsCol
+      .find({
+        farmId,
+        table: 'collector_assignments',
+        deleted: false,
+        'data.collector_user_id': viewer.userId,
+        'data.active': 1,
+      })
+      .toArray();
+    collectorSupplierUuids = new Set(
+      assignmentRows
+        .map((row) => row.data?.supplier_uuid)
+        .filter((uuid): uuid is string => typeof uuid === 'string')
+    );
+  }
+
+  const visibleDocs = viewer
+    ? selectedDocs.filter((doc) =>
+        recordVisibleTo(doc, viewer, { farmerSupplierUuids, collectorSupplierUuids })
+      )
+    : selectedDocs;
+
+  const changes: ServerChange[] = visibleDocs.map((doc) => ({
     table: doc.table,
     uuid: doc.uuid,
     op: doc.deleted ? 'delete' : 'upsert',

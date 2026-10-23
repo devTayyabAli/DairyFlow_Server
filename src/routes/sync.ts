@@ -1,7 +1,18 @@
 import { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
+import { UserRole } from '../db.js';
 import { changeSchema } from '../sync/schemas.js';
 import { applyPush, pullChanges } from '../sync/service.js';
+
+const ADMIN_TABLES = new Set([
+  'fat_rate_bands',
+  'collector_assignments',
+  'ledger_entries',
+  'settlements',
+  'advances',
+]);
+
+const SETTINGS_WRITERS: UserRole[] = ['owner', 'manager'];
 
 const pushBodySchema = z.object({
   changes: z.array(changeSchema).max(500, 'Batch size exceeds maximum limit of 500 changes'),
@@ -33,8 +44,60 @@ export const syncRoutes: FastifyPluginAsync = async (fastify) => {
       }
 
       const { changes } = parseResult.data;
-      const result = await applyPush(request.farmId, changes);
 
+      if (request.role === 'auditor' || request.role === 'farmer') {
+        const result = await applyPush(request.farmId, []);
+        result.rejected = changes.map((change) => ({
+          uuid: change.uuid,
+          table: change.table,
+          reason:
+            request.role === 'farmer'
+              ? 'A dairy account can see its milk but cannot change records.'
+              : 'Read-only role cannot change farm data.',
+        }));
+        return reply.send(result);
+      }
+
+      const preRejected: Array<{ uuid: string; table: string; reason: string }> = [];
+      let toApply = changes.filter((change) => {
+        if (request.role === 'collector' && change.table !== 'milk_collections') {
+          preRejected.push({
+            uuid: change.uuid,
+            table: change.table,
+            reason: 'A dodhi can only record milk collections.',
+          });
+          return false;
+        }
+        if (change.table === 'settings' && !SETTINGS_WRITERS.includes(request.role)) {
+          preRejected.push({
+            uuid: change.uuid,
+            table: change.table,
+            reason: 'Only the owner or a manager can change farm settings.',
+          });
+          return false;
+        }
+        if (ADMIN_TABLES.has(change.table) && !SETTINGS_WRITERS.includes(request.role)) {
+          preRejected.push({
+            uuid: change.uuid,
+            table: change.table,
+            reason: 'Only the owner can change rates, assignments, or payments.',
+          });
+          return false;
+        }
+        return true;
+      });
+      if (request.role === 'collector') {
+        toApply = toApply.map((change) => {
+          if (change.op !== 'upsert' || change.table !== 'milk_collections' || !change.data) return change;
+          return { ...change, data: { ...change.data, collector_id: request.userId } };
+        });
+      }
+
+      const result = await applyPush(request.farmId, toApply, {
+        userId: request.userId,
+        role: request.role,
+      });
+      result.rejected.push(...preRejected);
       return reply.send(result);
     }
   );
@@ -57,7 +120,10 @@ export const syncRoutes: FastifyPluginAsync = async (fastify) => {
       }
 
       const { since, limit } = parseResult.data;
-      const result = await pullChanges(request.farmId, since, limit);
+      const result = await pullChanges(request.farmId, since, limit, {
+        userId: request.userId,
+        role: request.role,
+      });
 
       return reply.send(result);
     }

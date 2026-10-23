@@ -1,10 +1,12 @@
+import { randomUUID } from 'node:crypto';
 import bcrypt from 'bcryptjs';
 import { FastifyInstance, FastifyPluginAsync, FastifyReply } from 'fastify';
 import { ObjectId } from 'mongodb';
 import { z } from 'zod';
-import { FarmDocument, getFarmsCollection } from '../db.js';
+import { FarmDocument, getFarmsCollection, getMembershipsCollection, UserRole } from '../db.js';
 import { checkLoginThrottle, clearLoginFailures, recordLoginFailure } from '../loginThrottle.js';
 import { IssueResult, issueOtp, OTP_LENGTH, verifyOtp } from '../otp.js';
+import { resolveAccountSession } from '../session.js';
 
 const emailSchema = z
   .string()
@@ -20,6 +22,7 @@ const registerSchema = z.object({
   password: z.string().min(8, 'Password must be at least 8 characters').max(128),
   phone: z.string().trim().max(32).optional(),
   defaultMilkRate: z.number().min(0).optional(),
+  businessType: z.enum(['farm', 'collection_center', 'hybrid']).default('farm').optional(),
 });
 
 const loginSchema = z.object({
@@ -52,13 +55,35 @@ const changePasswordSchema = z.object({
 // Compared against when the email is unknown, so response time does not reveal which emails exist.
 const DUMMY_HASH = bcrypt.hashSync('dairyflow-timing-equaliser', 10);
 
+function forbiddenRole(reply: FastifyReply) {
+  return reply.status(403).send({
+    error: { code: 'FORBIDDEN', message: 'You cannot assign a role at or above your own.' },
+  });
+}
+
 function validationError(reply: FastifyReply, issues: z.ZodIssue[]) {
   return reply.status(400).send({
     error: { code: 'VALIDATION_ERROR', message: issues.map((i) => i.message).join(', ') },
   });
 }
 
-function farmPayload(farm: FarmDocument & { _id: NonNullable<FarmDocument['_id']> }) {
+function accountResponse(
+  profile: FarmDocument & { _id: NonNullable<FarmDocument['_id']> },
+  role: UserRole,
+  userId: string,
+  accountName?: string
+) {
+  return {
+    ...farmPayload(profile, role),
+    userId,
+    accountName: accountName || profile.ownerName,
+  };
+}
+
+function farmPayload(
+  farm: FarmDocument & { _id: NonNullable<FarmDocument['_id']> },
+  role: UserRole = 'owner'
+) {
   return {
     id: farm._id.toString(),
     farmName: farm.farmName,
@@ -66,6 +91,8 @@ function farmPayload(farm: FarmDocument & { _id: NonNullable<FarmDocument['_id']
     email: farm.email,
     phone: farm.phone,
     defaultMilkRate: farm.defaultMilkRate ?? 220,
+    businessType: farm.businessType ?? 'farm',
+    role,
     createdAt: farm.createdAt.toISOString(),
   };
 }
@@ -90,8 +117,12 @@ function otpIssueFailure(reply: FastifyReply, result: Exclude<IssueResult, { ok:
     .send({ error: { code, message, retryAfterSeconds: result.retryAfterSeconds } });
 }
 
-function signToken(fastify: FastifyInstance, farmId: string, passwordChangedAt?: Date): string {
-  return fastify.issueToken(farmId, passwordChangedAt);
+function signToken(
+  fastify: FastifyInstance,
+  farmId: string,
+  optionsOrPasswordChangedAt?: Date | { userId?: string; role?: UserRole; passwordChangedAt?: Date }
+): string {
+  return fastify.issueToken(farmId, optionsOrPasswordChangedAt);
 }
 
 function throttled(reply: FastifyReply, retryAfterSeconds: number) {
@@ -136,7 +167,7 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
       const parsed = registerSchema.safeParse(request.body);
       if (!parsed.success) return validationError(reply, parsed.error.issues);
 
-      const { farmName, ownerName, email, password, phone, defaultMilkRate } = parsed.data;
+      const { farmName, ownerName, email, password, phone, defaultMilkRate, businessType } = parsed.data;
       const farms = getFarmsCollection();
       const existing = await farms.findOne({ email });
 
@@ -160,6 +191,7 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
               phone,
               passwordHash,
               defaultMilkRate: defaultMilkRate ?? 220,
+              businessType: businessType ?? 'farm',
               updatedAt: now,
             },
           }
@@ -174,6 +206,7 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
             phone,
             passwordHash,
             defaultMilkRate: defaultMilkRate ?? 220,
+            businessType: businessType ?? 'farm',
             createdAt: now,
             updatedAt: now,
           });
@@ -225,8 +258,13 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
       await farms.updateOne({ _id: farm._id }, { $set: { emailVerified: true, updatedAt: now } });
 
       return reply.status(201).send({
-        token: signToken(fastify, farm._id!.toString()),
-        farm: farmPayload({ ...farm, _id: farm._id!, emailVerified: true }),
+        token: signToken(fastify, farm._id!.toString(), { role: 'owner' }),
+        farm: accountResponse(
+          { ...farm, _id: farm._id!, emailVerified: true },
+          'owner',
+          farm._id!.toString(),
+          farm.ownerName
+        ),
       });
     }
   );
@@ -291,10 +329,21 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
         });
       }
 
+      const resolved = await resolveAccountSession({ ...farm, _id: farm._id! });
+      if (!resolved.ok) {
+        return reply.status(403).send({
+          error: { code: 'ACCOUNT_SUSPENDED', message: 'This account is suspended.' },
+        });
+      }
+      const { session } = resolved;
+
       await clearLoginFailures(email);
       return reply.status(200).send({
-        token: signToken(fastify, farm._id!.toString()),
-        farm: farmPayload({ ...farm, _id: farm._id! }),
+        token: signToken(fastify, session.tenantId, {
+          userId: session.userId,
+          role: session.role,
+        }),
+        farm: accountResponse(session.profile, session.role, session.userId, farm.ownerName),
       });
     }
   );
@@ -350,9 +399,21 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
       );
       await clearLoginFailures(email);
 
+      const resolved = await resolveAccountSession({ ...farm, _id: farm._id!, passwordChangedAt });
+      if (!resolved.ok) {
+        return reply.status(403).send({
+          error: { code: 'ACCOUNT_SUSPENDED', message: 'This account is suspended.' },
+        });
+      }
+      const { session } = resolved;
+
       return reply.status(200).send({
-        token: signToken(fastify, farm._id!.toString(), passwordChangedAt),
-        farm: farmPayload({ ...farm, _id: farm._id! }),
+        token: signToken(fastify, session.tenantId, {
+          userId: session.userId,
+          role: session.role,
+          passwordChangedAt,
+        }),
+        farm: accountResponse(session.profile, session.role, session.userId, farm.ownerName),
       });
     }
   );
@@ -369,21 +430,21 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
       const { currentPassword, newPassword } = parsed.data;
 
       const farms = getFarmsCollection();
-      const farm = await farms.findOne({ _id: new ObjectId(request.farmId) });
-      if (!farm) {
+      const account = await farms.findOne({ _id: new ObjectId(request.userId) });
+      if (!account) {
         return reply.status(401).send({
           error: { code: 'UNAUTHORIZED', message: 'Invalid authorization token' },
         });
       }
 
       // A stolen token must not allow guessing the current password: share the login throttle.
-      if (farm.email) {
-        const gate = await checkLoginThrottle(farm.email);
+      if (account.email) {
+        const gate = await checkLoginThrottle(account.email);
         if (gate.blocked) return throttled(reply, gate.retryAfterSeconds);
       }
 
-      if (!(await bcrypt.compare(currentPassword, farm.passwordHash))) {
-        if (farm.email) await recordLoginFailure(farm.email);
+      if (!(await bcrypt.compare(currentPassword, account.passwordHash))) {
+        if (account.email) await recordLoginFailure(account.email);
         return reply.status(401).send({
           error: { code: 'INVALID_CREDENTIALS', message: 'Current password is incorrect' },
         });
@@ -400,12 +461,189 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
       const passwordChangedAt = new Date();
       const passwordHash = await bcrypt.hash(newPassword, 10);
       await farms.updateOne(
-        { _id: farm._id },
+        { _id: account._id },
         { $set: { passwordHash, passwordChangedAt, updatedAt: passwordChangedAt } }
       );
-      if (farm.email) await clearLoginFailures(farm.email);
+      if (account.email) await clearLoginFailures(account.email);
 
-      return reply.status(200).send({ token: signToken(fastify, farm._id!.toString(), passwordChangedAt) });
+      const resolved = await resolveAccountSession({ ...account, _id: account._id!, passwordChangedAt });
+      if (!resolved.ok) {
+        return reply.status(403).send({
+          error: { code: 'ACCOUNT_SUSPENDED', message: 'This account is suspended.' },
+        });
+      }
+      const { session } = resolved;
+      return reply.status(200).send({
+        token: signToken(fastify, session.tenantId, {
+          userId: session.userId,
+          role: session.role,
+          passwordChangedAt,
+        }),
+      });
+    }
+  );
+
+  // Get active user profile, tenant, and role
+  fastify.get('/auth/me', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+    const farm = await getFarmsCollection().findOne({ _id: new ObjectId(request.farmId) });
+    if (!farm) {
+      return reply.status(404).send({ error: { code: 'NOT_FOUND', message: 'Account not found' } });
+    }
+    return reply.send({
+      user: {
+        id: request.userId,
+        email: farm.email,
+        name: farm.ownerName,
+        phone: farm.phone,
+        role: request.role,
+      },
+      tenant: {
+        id: farm._id!.toString(),
+        name: farm.farmName,
+        businessType: farm.businessType ?? 'farm',
+        defaultMilkRate: farm.defaultMilkRate ?? 220,
+      },
+      role: request.role,
+    });
+  });
+
+  const memberInviteSchema = z.object({
+    name: z.string().min(1).optional(),
+    email: emailSchema,
+    password: z.string().min(8).optional(),
+    role: z.enum(['owner', 'manager', 'accountant', 'staff', 'collector', 'farmer', 'auditor']),
+    assignedRoutes: z.array(z.string().trim()).optional(),
+  });
+
+  // Add team member with role (Restricted to Owner & Manager per PRD permission matrix)
+  fastify.post(
+    '/tenants/members',
+    {
+      onRequest: [fastify.authenticate, fastify.authorize(['owner', 'manager'])],
+    },
+    async (request, reply) => {
+      const parsed = memberInviteSchema.safeParse(request.body);
+      if (!parsed.success) return validationError(reply, parsed.error.issues);
+
+      const { name, email, password, role, assignedRoutes } = parsed.data;
+      if (request.role === 'manager' && (role === 'owner' || role === 'manager')) {
+        return forbiddenRole(reply);
+      }
+      const tenantId = new ObjectId(request.tenantId);
+      const memberships = getMembershipsCollection();
+      const farms = getFarmsCollection();
+
+      const now = new Date();
+      let user = await farms.findOne({ email });
+      let targetUserId = user?._id;
+
+      if (!user) {
+        const passwordHash = password
+          ? await bcrypt.hash(password, 10)
+          : await bcrypt.hash(randomUUID(), 10);
+
+        const insertRes = await farms.insertOne({
+          farmName: '',
+          ownerName: name || email.split('@')[0],
+          email,
+          passwordHash,
+          emailVerified: true,
+          createdAt: now,
+          updatedAt: now,
+        });
+        targetUserId = insertRes.insertedId;
+      }
+
+      await memberships.updateOne(
+        { tenantId, userId: targetUserId! },
+        {
+          $set: {
+            tenantId,
+            userId: targetUserId!,
+            role,
+            assignedRoutes: assignedRoutes ?? [],
+            status: 'active',
+            updatedAt: now,
+          },
+          $setOnInsert: { createdAt: now },
+        },
+        { upsert: true }
+      );
+
+      return reply.status(201).send({
+        status: 'MEMBER_ADDED',
+        member: {
+          userId: targetUserId!.toString(),
+          email,
+          name: name || email.split('@')[0],
+          role,
+          assignedRoutes: assignedRoutes ?? [],
+        },
+      });
+    }
+  );
+
+  // List team members (Restricted to Owner, Manager, Auditor per PRD)
+  fastify.get(
+    '/tenants/members',
+    {
+      onRequest: [fastify.authenticate, fastify.authorize(['owner', 'manager', 'auditor'])],
+    },
+    async (request, reply) => {
+      const tenantId = new ObjectId(request.tenantId);
+      const members = await getMembershipsCollection().find({ tenantId }).toArray();
+      const userIds = members.map((m) => m.userId);
+      const users = await getFarmsCollection()
+        .find({ _id: { $in: userIds } })
+        .toArray();
+      const userMap = new Map(users.map((u) => [u._id!.toString(), u]));
+
+      return reply.send({
+        members: members.map((m) => {
+          const u = userMap.get(m.userId.toString());
+          return {
+            id: m._id!.toString(),
+            userId: m.userId.toString(),
+            name: u?.ownerName || '',
+            email: u?.email || '',
+            role: m.role,
+            assignedRoutes: m.assignedRoutes ?? [],
+            status: m.status,
+            createdAt: m.createdAt.toISOString(),
+          };
+        }),
+      });
+    }
+  );
+
+  fastify.post(
+    '/tenants/members/:userId/status',
+    {
+      onRequest: [fastify.authenticate, fastify.authorize(['owner'])],
+    },
+    async (request, reply) => {
+      const params = z.object({ userId: z.string().min(1) }).safeParse(request.params);
+      const body = z.object({ status: z.enum(['active', 'suspended']) }).safeParse(request.body);
+      if (!params.success || !body.success) {
+        return reply.status(400).send({ error: { code: 'VALIDATION_ERROR', message: 'Invalid member status.' } });
+      }
+      if (params.data.userId === request.userId) {
+        return reply.status(400).send({ error: { code: 'VALIDATION_ERROR', message: 'You cannot change your own account status.' } });
+      }
+      let memberId: ObjectId;
+      try {
+        memberId = new ObjectId(params.data.userId);
+      } catch {
+        return reply.status(400).send({ error: { code: 'VALIDATION_ERROR', message: 'Invalid member.' } });
+      }
+      const result = await getMembershipsCollection().updateOne(
+        { tenantId: new ObjectId(request.tenantId), userId: memberId },
+        { $set: { status: body.data.status, updatedAt: new Date() } }
+      );
+      if (result.matchedCount === 0) {
+        return reply.status(404).send({ error: { code: 'NOT_FOUND', message: 'Member not found.' } });
+      }
+      return reply.send({ status: body.data.status });
     }
   );
 };

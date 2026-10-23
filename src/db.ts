@@ -1,14 +1,5 @@
-import dns from 'node:dns';
 import { Collection, Db, MongoClient, ObjectId } from 'mongodb';
 import { config } from './config.js';
-
-if (config.MONGODB_URI.startsWith('mongodb+srv://')) {
-  try {
-    dns.setServers(['8.8.8.8', '1.1.1.1']);
-  } catch {
-    // Ignore if not permitted in environment
-  }
-}
 
 export interface FarmDocument {
   _id?: ObjectId;
@@ -21,8 +12,63 @@ export interface FarmDocument {
   phone?: string;
   passwordHash: string;
   defaultMilkRate?: number;
+  /** Business type: 'farm' (default) or 'collection_center'. */
+  businessType?: 'farm' | 'collection_center' | 'hybrid';
   /** Set on password reset/change; JWTs issued before it are rejected (see plugins/auth.ts). */
   passwordChangedAt?: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export type UserRole =
+  | 'owner'
+  | 'manager'
+  | 'accountant'
+  | 'staff'
+  | 'collector'
+  | 'farmer'
+  | 'auditor';
+
+export type TenantType = 'farm' | 'collection_center' | 'hybrid';
+
+export interface TenantDocument {
+  _id?: ObjectId;
+  name: string;
+  type: TenantType;
+  ownerEmail: string;
+  contactPhone?: string;
+  settlementDay: string; // 'Friday'
+  fatPricingRules?: {
+    baseRate: number;
+    referenceFat: number;
+    slopePerPoint: number;
+    effectiveFrom?: Date;
+  }[];
+  status: 'active' | 'suspended';
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface MembershipDocument {
+  _id?: ObjectId;
+  tenantId: ObjectId;
+  userId: ObjectId;
+  role: UserRole;
+  assignedRoutes?: string[]; // for collectors
+  status: 'active' | 'suspended';
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface SupplierDocument {
+  _id?: ObjectId;
+  tenantId: ObjectId;
+  code: string; // unique per tenant, e.g. "SUP-001"
+  name: string;
+  phone?: string;
+  address?: string;
+  defaultRate?: number;
+  linkedFarmId?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -129,6 +175,18 @@ export function getCountersCollection(): Collection<CounterDocument> {
   return getDb().collection<CounterDocument>('counters');
 }
 
+export function getTenantsCollection(): Collection<TenantDocument> {
+  return getDb().collection<TenantDocument>('tenants');
+}
+
+export function getMembershipsCollection(): Collection<MembershipDocument> {
+  return getDb().collection<MembershipDocument>('memberships');
+}
+
+export function getSuppliersCollection(): Collection<SupplierDocument> {
+  return getDb().collection<SupplierDocument>('suppliers');
+}
+
 export async function ensureIndexes(): Promise<void> {
   const farms = getFarmsCollection();
   // Login moved from phone to email: phone is no longer unique/required.
@@ -152,4 +210,14 @@ export async function ensureIndexes(): Promise<void> {
   const records = getRecordsCollection();
   await records.createIndex({ farmId: 1, table: 1, uuid: 1 }, { unique: true });
   await records.createIndex({ farmId: 1, seq: 1 });
+
+  const tenants = getTenantsCollection();
+  await tenants.createIndex({ ownerEmail: 1 });
+
+  const memberships = getMembershipsCollection();
+  await memberships.createIndex({ tenantId: 1, userId: 1 }, { unique: true });
+  await memberships.createIndex({ userId: 1 });
+
+  const suppliers = getSuppliersCollection();
+  await suppliers.createIndex({ tenantId: 1, code: 1 }, { unique: true });
 }
