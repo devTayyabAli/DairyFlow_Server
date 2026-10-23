@@ -4,9 +4,9 @@
   "description": "DairyFlow backend API with Fastify and MongoDB",
   "main": "dist/server.js",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "build": "tsc",
-    "start": "node dist/server.js",
+    "dev": "node init && tsx watch src/server.ts",
+    "build": "node init && tsc",
+    "start": "node init && node dist/server.js",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
